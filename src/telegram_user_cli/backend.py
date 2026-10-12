@@ -16,11 +16,14 @@ import asyncio
 import base64
 from datetime import datetime
 import json
+import io
 import os
 import re
+import select
+import stat
 import sys
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -38,9 +41,10 @@ except Exception:  # pragma: no cover - POSIX fallback
 from .compat import create_telegram_client
 
 try:
-  from telethon import functions
+  from telethon import functions, utils
 except Exception:  # pragma: no cover - import failure is reported by command execution
   functions = None
+  utils = None
 
 
 # Resolve the default at invocation time so changing XDG_DATA_HOME before a
@@ -346,9 +350,62 @@ def acquire_session_lock(session_path: Path, timeout_seconds: int = DEFAULT_LOCK
     yield
 
 
+@asynccontextmanager
+async def acquire_session_lock_async(session_path: Path, timeout_seconds=DEFAULT_LOCK_TIMEOUT_SECONDS, *, lock_path_override=None):
+  # Runtime locking must yield while another process owns SQLite. This keeps
+  # the outer RPC deadline and cancellation effective without worker threads.
+  if fcntl is None and msvcrt is None:
+    raise RuntimeError("Session locking is unavailable on this operating system.")
+  deadline = time.monotonic() + max(0, timeout_seconds)
+  acquired = []
+  with ExitStack() as stack:
+    try:
+      for path in resolve_session_lock_paths(session_path, lock_path_override):
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        handle = stack.enter_context(open(path, "a+", encoding="utf-8"))
+        os.chmod(path, 0o600)
+        if fcntl is None:
+          handle.seek(0)
+          if not handle.read(1):
+            handle.write(" ")
+            handle.flush()
+        while True:
+          try:
+            if fcntl is not None:
+              fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+              handle.seek(0)
+              msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            acquired.append(handle)
+            break
+          except OSError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+              raise TimeoutError("timed out waiting for Telegram user session lock") from None
+            await asyncio.sleep(min(0.05, remaining))
+      yield
+    finally:
+      for handle in reversed(acquired):
+        if fcntl is not None:
+          fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        else:
+          handle.seek(0)
+          msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def canonical_peer_id(entity):
+  # Marked Telegram IDs distinguish users (+id), basic groups (-id), and
+  # channels/supergroups (-100…id). Bare entity.id can select another recipient.
+  if entity is None:
+    return None
+  if utils is None:
+    raise RuntimeError("Telethon peer utilities are unavailable.")
+  return utils.get_peer_id(entity)
+
+
 def build_chat_payload(chat) -> dict[str, object | None]:
   return {
-    "chat_id": int(getattr(chat, "id", 0) or 0) or None,
+    "chat_id": canonical_peer_id(chat),
     "peer_type": type(chat).__name__,
     "title": getattr(chat, "title", None),
     "username": getattr(chat, "username", None),
@@ -585,7 +642,7 @@ def build_dialog_payload(dialog) -> dict[str, object | None]:
   last_message = getattr(dialog, "message", None)
   return {
     "archived": bool(getattr(dialog, "archived", False)),
-    "chat_id": int(getattr(entity, "id", 0) or 0) or None,
+    "chat_id": canonical_peer_id(entity),
     "chat_title": title,
     "chat_username": username,
     "display_name": name or title or username or str(getattr(entity, "id", "unknown")),
@@ -780,7 +837,10 @@ def resolve_text_payload(args, name: str) -> str:
       raise ValueError(f"Use --{name}-file for multiline or escape-sensitive text.")
     raw = inline.encode("utf-8")
   elif file_path is not None and file_path != "-":
-    with open(Path(file_path).expanduser(), "rb") as handle:
+    path = Path(file_path).expanduser()
+    if not stat.S_ISREG(path.stat().st_mode):
+      raise ValueError("Text input must be a regular UTF-8 file; use - for a pipe.")
+    with open(path, "rb") as handle:
       raw = handle.read(MAX_INPUT_BYTES + 1)
   elif stdin or file_path == "-":
     if hasattr(sys.stdin, "buffer"):
@@ -794,9 +854,55 @@ def resolve_text_payload(args, name: str) -> str:
   return raw.decode("utf-8")
 
 
+class InputTimeoutError(TimeoutError):
+  pass
+
+
+async def read_stdin_bounded(args, *, single_line=False) -> bytes:
+  # Pipes may never close. Poll a real POSIX descriptor without blocking the
+  # event loop or leaving a thread stuck in read() after timeout/cancellation.
+  timeout = float(getattr(args, "rpc_timeout", 60))
+  deadline = time.monotonic() + timeout
+  try:
+    fd = sys.stdin.fileno()
+  except (AttributeError, io.UnsupportedOperation):
+    # In-memory streams are finite and used by interactive-login/test callers.
+    raw = sys.stdin.readline(MAX_INPUT_BYTES + 1) if single_line else sys.stdin.read(MAX_INPUT_BYTES + 1)
+    data = raw.encode("utf-8") if isinstance(raw, str) else raw
+    if len(data) > MAX_INPUT_BYTES:
+      raise ValueError("Text input exceeds 4 MiB.")
+    return data
+  if os.name != "posix":
+    raise ValueError("Bounded stdin requires POSIX; use a UTF-8 file instead.")
+  data = bytearray()
+  while True:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+      raise InputTimeoutError("Timed out waiting for stdin; the producer must close the pipe.")
+    if not select.select([fd], [], [], 0)[0]:
+      await asyncio.sleep(min(0.02, remaining))
+      continue
+    chunk = os.read(fd, 1 if single_line else min(65536, MAX_INPUT_BYTES + 1 - len(data)))
+    if not chunk:
+      return bytes(data)
+    data.extend(chunk)
+    if len(data) > MAX_INPUT_BYTES:
+      raise ValueError("Text input exceeds 4 MiB.")
+    if single_line and chunk == b"\n":
+      return bytes(data)
+
+
+async def resolve_text_payload_async(args, name: str) -> str:
+  if getattr(args, name + "_stdin", False) or getattr(args, name + "_file", None) == "-":
+    return (await read_stdin_bounded(args)).decode("utf-8")
+  return resolve_text_payload(args, name)
+
+
 def validate_args(args):
   # Reject malformed bounds and conflicting selectors before opening a session
   # or contacting Telegram. Zero is only valid for optional absent ID bounds.
+  if float(getattr(args, "rpc_timeout", 60)) <= 0:
+    raise ValueError("--rpc-timeout must be positive.")
   for name in ("message_id", "topic_anchor", "limit"):
     value = getattr(args, name, None)
     if value is not None and (isinstance(value, bool) or int(value) <= 0):
@@ -935,8 +1041,10 @@ async def connect_client(session_path: Path) -> tuple[Any, object]:
     flood_sleep_threshold = 0,
     request_retries = 0,
     connection_retries = 0,
-    parse_mode = None,
   )
+  # Telethon exposes parse_mode as a property, not a constructor parameter.
+  # Disable Markdown interpretation so generated text reaches Telegram literally.
+  client.parse_mode = None
   try:
     await client.connect()
     if not await client.is_user_authorized():
@@ -959,7 +1067,7 @@ async def run_precheck(args: argparse.Namespace) -> int:
       details = {"session_path": str(session_path)},
     )
 
-  with acquire_session_lock(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
     client, me = await connect_client(session_path)
     try:
       chat_payload = None
@@ -993,7 +1101,7 @@ async def run_status(args: argparse.Namespace) -> int:
     )
 
   if session_path.exists():
-    with acquire_session_lock(session_path, lock_path_override = getattr(args, "lock", None)):
+    async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
       api_id, api_hash = resolve_api_credentials()
       client = create_telegram_client(
         session_path,
@@ -1054,13 +1162,13 @@ async def run_status(args: argparse.Namespace) -> int:
 async def run_login(args: argparse.Namespace) -> int:
   session_path = resolve_session_path(args.session)
   phone = str(args.phone or "").strip()
-  secret = sys.stdin.readline().rstrip("\r\n") if args.secret_stdin else ""
+  secret = (await read_stdin_bounded(args, single_line=True)).decode("utf-8").rstrip("\r\n") if args.secret_stdin else ""
   code = secret if args.secret_stdin == "code" else ""
   password = secret if args.secret_stdin == "password" else ""
   if not phone:
     return fail("E_USAGE", "Telegram login requires --phone.")
 
-  with acquire_session_lock(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
     api_id, api_hash = resolve_api_credentials()
     client = create_telegram_client(
       session_path,
@@ -1221,13 +1329,13 @@ async def run_login(args: argparse.Namespace) -> int:
 
 async def run_send(args: argparse.Namespace) -> int:
   session_path = resolve_session_path(args.session)
-  message_text = resolve_text_payload(args, "message")
+  message_text = await resolve_text_payload_async(args, "message")
   media = str(args.media or "").strip()
-  caption = resolve_text_payload(args, "caption")
+  caption = await resolve_text_payload_async(args, "caption")
   reply_to = getattr(args, "topic_anchor", None) or args.reply_to or None
   if not message_text.strip() and not media:
     return fail("E_USAGE", "Telegram send requires --message or --media.")
-  with acquire_session_lock(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
     client, _ = await connect_client(session_path)
     try:
       # Resolve once so send and the acknowledgement apply to exactly the same
@@ -1296,7 +1404,7 @@ async def run_topic_create(args: argparse.Namespace) -> int:
   title = str(args.title or "").strip()
   if not title:
     return fail("E_USAGE", "Telegram topic-create requires --title.")
-  with acquire_session_lock(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
     client, _ = await connect_client(session_path)
     try:
       updates = await client(
@@ -1323,7 +1431,7 @@ async def run_topic_delete(args: argparse.Namespace) -> int:
   topic_anchor = int(args.topic_anchor or 0)
   if topic_anchor <= 0:
     return fail("E_USAGE", "Telegram topic-delete requires --topic-anchor.")
-  with acquire_session_lock(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
     client, _ = await connect_client(session_path)
     try:
       result = await client(
@@ -1350,7 +1458,7 @@ async def run_topic_resolve(args: argparse.Namespace) -> int:
   title = str(args.title or "").strip()
   if not title:
     return fail("E_USAGE", "Telegram topic-resolve requires --title.")
-  with acquire_session_lock(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
     client, _ = await connect_client(session_path)
     try:
       # Telegram applies q server-side. The exact normalized comparison below
@@ -1452,7 +1560,7 @@ async def run_read(args: argparse.Namespace) -> int:
   topic_anchor = int(topic_anchor_raw or 0)
   if topic_anchor_raw is not None and topic_anchor <= 0:
     return fail("E_USAGE", "Telegram read --topic-anchor must be a positive integer.")
-  with acquire_session_lock(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
     client, _ = await connect_client(session_path)
     try:
       chat = resolve_chat(args.chat)
@@ -1605,7 +1713,7 @@ async def run_read(args: argparse.Namespace) -> int:
 
 async def run_mark_read(args: argparse.Namespace) -> int:
   session_path = resolve_session_path(args.session)
-  with acquire_session_lock(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
     client, _ = await connect_client(session_path)
     try:
       # Omitting a message/max_id tells Telethon to acknowledge the current
@@ -1620,7 +1728,7 @@ async def run_mark_unread(args: argparse.Namespace) -> int:
   if functions is None:
     return fail("E_TELETHON_IMPORT", "Telethon dialog read-state functions are unavailable.")
   session_path = resolve_session_path(args.session)
-  with acquire_session_lock(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
     client, _ = await connect_client(session_path)
     try:
       # Telegram models this as a dialog-level unread flag, not as rewinding
@@ -1645,7 +1753,7 @@ async def run_download(args: argparse.Namespace) -> int:
   if not output_raw:
     return fail("E_USAGE", "Telegram download requires --output.")
 
-  with acquire_session_lock(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
     client, _ = await connect_client(session_path)
     try:
       message = await client.get_messages(resolve_chat(args.chat), ids = message_id)
@@ -1691,7 +1799,7 @@ async def run_button_click(args: argparse.Namespace) -> int:
     )
 
   expected_callback_bytes = callback_data.encode("utf-8")
-  with acquire_session_lock(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
     client, _ = await connect_client(session_path)
     try:
       # Fetch by explicit id from the explicit chat. Never scan recent history:
@@ -1781,7 +1889,7 @@ async def run_inbox(args: argparse.Namespace) -> int:
   session_path = resolve_session_path(args.session)
   limit = max(1, min(int(args.limit or 20), 200))
   contains = str(args.contains or "")
-  with acquire_session_lock(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
     client, _ = await connect_client(session_path)
     try:
       dialogs = []
@@ -1811,7 +1919,7 @@ async def run_inbox(args: argparse.Namespace) -> int:
 
 async def run_logout(args: argparse.Namespace) -> int:
   session_path = resolve_session_path(args.session)
-  with acquire_session_lock(session_path, lock_path_override=getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override=getattr(args, "lock", None)):
     removed_paths = clear_session_artifacts(session_path)
   return emit({"cleared": bool(removed_paths), "removed_paths": removed_paths, "session_path": str(session_path)})
 
@@ -1855,6 +1963,8 @@ async def run(args: argparse.Namespace | None = None) -> int:
     if args.command == "inbox":
       return await run_inbox(args)
     return fail("E_USAGE", f"Unsupported command: {args.command}")
+  except InputTimeoutError as err:
+    return fail("E_INPUT_TIMEOUT", sanitize_error_text(str(err)))
   except TimeoutError as err:
     return fail("E_SESSION_LOCK_TIMEOUT", sanitize_error_text(str(err)))
   except PermissionError as err:

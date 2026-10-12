@@ -15,7 +15,7 @@ from telegram_user_cli import backend as b
 
 class BackendTests(unittest.TestCase):
   def setUp(self):
-    self.directory = tempfile.TemporaryDirectory(dir="/private/tmp")
+    self.directory = tempfile.TemporaryDirectory()
     self.addCleanup(self.directory.cleanup)
     self.session = str(Path(self.directory.name) / "user.session")
 
@@ -185,6 +185,48 @@ class BackendTests(unittest.TestCase):
     self.assertEqual(status, 1)
     self.assertEqual(json.loads(error)["error"]["code"], "E_BUTTON_MISMATCH")
     message.click.assert_not_awaited()
+
+  def test_chat_and_dialog_ids_are_marked_for_recipient_reuse(self):
+    from telethon.tl.types import PeerUser, PeerChat, PeerChannel
+    for peer, expected in ((PeerUser(123), 123), (PeerChat(123), -123), (PeerChannel(123), -1000000000123)):
+      with self.subTest(peer=peer):
+        self.assertEqual(b.build_chat_payload(peer)["chat_id"], expected)
+        self.assertEqual(b.build_dialog_payload(SimpleNamespace(entity=peer))["chat_id"], expected)
+        self.assertEqual(b.resolve_chat(str(expected)), expected)
+
+  def test_runtime_lock_is_cancellable_before_network(self):
+    if b.fcntl is None:
+      self.skipTest("POSIX locking regression")
+    args = self.args("read", "--chat", "123")
+    async def blocked():
+      with b.acquire_session_lock(Path(self.session)):
+        with patch.object(b, "resolve_api_credentials", return_value=(123, "fake")), patch.object(b, "connect_client") as connect:
+          with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(b.run(args), timeout=0.05)
+          connect.assert_not_called()
+      # Cancellation closes every opened lock handle; a subsequent operation
+      # can acquire the exact session immediately.
+      async with b.acquire_session_lock_async(Path(self.session), timeout_seconds=0):
+        pass
+    asyncio.run(blocked())
+
+  def test_unclosed_stdin_pipe_times_out_without_network(self):
+    if os.name != "posix":
+      self.skipTest("POSIX stdin regression")
+    for command in ("send", "login"):
+      read_fd, write_fd = os.pipe()
+      args = self.args("send", "--chat", "123", "--message-file", "-") if command == "send" else self.args("login", "--phone", "+123", "--secret-stdin", "code")
+      args.rpc_timeout = 0.05
+      try:
+        os.write(write_fd, b"partial")
+        with os.fdopen(read_fd, "r", encoding="utf-8") as stdin, patch.object(b.sys, "stdin", stdin), patch.object(b, "resolve_api_credentials", return_value=(123, "fake")), patch.object(b, "connect_client") as connect, patch.object(b, "create_telegram_client") as create:
+          status, output, error = self.invoke(args)
+        self.assertEqual((status, output), (1, ""))
+        self.assertEqual(json.loads(error)["error"]["code"], "E_INPUT_TIMEOUT")
+        connect.assert_not_called()
+        create.assert_not_called()
+      finally:
+        os.close(write_fd)
 
 
 if __name__ == "__main__":

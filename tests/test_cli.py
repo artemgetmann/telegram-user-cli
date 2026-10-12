@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from telethon import TelegramClient
+
 from telegram_user_cli import backend, cli
 
 
@@ -85,6 +87,26 @@ class CliTests(unittest.TestCase):
         self.assertTrue(json.loads(out.getvalue())["timed_out"])
         sender.assert_not_called()
 
+    def test_wait_pages_past_one_hundred_nonmatching_messages(self):
+        args = self.parse("wait", "--chat", "me", "--after-id", "10", "--sender-id", "123",
+                          "--contains", "reply")
+        newest = {"messages": [{"message_id": message_id, "out": True, "sender_id": 123}
+                               for message_id in range(111, 11, -1)]}
+        older = {"messages": [{"message_id": 11, "out": False, "sender_id": 123,
+                                "text": "OLDER REPLY"}]}
+        cursors = []
+
+        async def page(namespace):
+            cursors.append(namespace.before_id)
+            self.assertEqual(namespace.contains, "")
+            return 0, newest if namespace.before_id == 0 else older
+
+        out = io.StringIO()
+        with patch.object(cli, "capture", side_effect=page), redirect_stdout(out):
+            self.assertEqual(asyncio.run(cli.wait_for_message(args)), 0)
+        self.assertEqual(cursors, [0, 12])
+        self.assertEqual(json.loads(out.getvalue())["messages"][0]["message_id"], 11)
+
     def test_operation_timeout_reports_uncertainty_and_does_not_retry(self):
         args = self.parse("send", "--chat", "me", "--message", "hello", "--rpc-timeout", "0.01")
 
@@ -96,6 +118,22 @@ class CliTests(unittest.TestCase):
             self.assertEqual(asyncio.run(cli.invoke(args)), 1)
         runner.assert_awaited_once()
         self.assertEqual(json.loads(err.getvalue())["error"]["code"], "E_TIMEOUT")
+
+    def test_real_telethon_constructor_accepts_transport_options(self):
+        # Exercise the real library boundary. Replacing the whole factory would
+        # hide invalid constructor keywords even while all fake-client tests pass.
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(backend, "resolve_api_credentials", return_value=(123, "fixture")), \
+                patch.object(TelegramClient, "connect", AsyncMock()), \
+                patch.object(TelegramClient, "is_user_authorized", AsyncMock(return_value=True)), \
+                patch.object(TelegramClient, "get_me", AsyncMock(return_value=object())), \
+                patch.object(TelegramClient, "disconnect", AsyncMock()):
+            async def check():
+                client, _ = await backend.connect_client(Path(directory) / "user.session")
+                self.assertIsNone(client.parse_mode)
+                await client.disconnect()
+                client.session.close()
+            asyncio.run(check())
 
     def test_interactive_login_uses_stdin_for_code_and_password(self):
         args = self.parse("login", "--phone", "+15550000000")

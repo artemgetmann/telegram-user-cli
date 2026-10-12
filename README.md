@@ -104,6 +104,16 @@ get the account owner's authorization, send once, and read back the returned mes
 Agents should use `--message-file` and `--caption-file`. Inline text is a convenience
 for simple human input and rejects ambiguous multiline or backslash content.
 
+For a runnable, account-free demonstration of that workflow:
+
+```sh
+.venv/bin/python examples/demo.py
+```
+
+The demo uses synthetic messages and clearly labels its transport fixture. It does
+not connect to Telegram and is not evidence of live message delivery.
+An [asciinema replay](examples/demo.cast) of the same fixture output is also included.
+
 ## Output and failure behavior
 
 Success is one JSON record on stdout. Errors are JSON on stderr with a nonzero exit.

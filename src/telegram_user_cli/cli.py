@@ -169,6 +169,9 @@ async def wait_for_message(args: argparse.Namespace) -> int:
     read_args.command = "read"
     read_args.limit = 100
     read_args.before_id = 0
+    # Filter locally so an empty filtered transport page cannot hide an older
+    # inbound reply from the requested sender. Walk every page back to after_id.
+    read_args.contains = ""
     deadline = time.monotonic() + args.timeout
     while True:
         remaining = deadline - time.monotonic()
@@ -181,11 +184,19 @@ async def wait_for_message(args: argparse.Namespace) -> int:
         messages = result.get("messages", [])
         matches = [message for message in messages
                    if not message.get("out") and int(message.get("message_id", 0)) > args.after_id
-                   and (args.sender_id is None or message.get("sender_id") == args.sender_id)]
+                   and (args.sender_id is None or message.get("sender_id") == args.sender_id)
+                   and args.contains.casefold() in str(message.get("text", "")).casefold()]
         if matches:
             return backend.emit({"matched": True, "timed_out": False, "messages": matches})
-        # Retain the caller's cursor: advancing it over a filtered page could
-        # skip a delayed or older matching message in a busy conversation.
+        if len(messages) >= read_args.limit:
+            oldest = min(int(message.get("message_id", 0)) for message in messages)
+            if oldest > args.after_id and (not read_args.before_id or oldest < read_args.before_id):
+                read_args.before_id = oldest
+                continue
+            return backend.fail("E_WAIT_INCOMPLETE", "Message history did not advance; reply coverage is incomplete.")
+        # A short page proves this poll covered the requested interval. Start
+        # from the newest page again after the delay to observe newly arriving replies.
+        read_args.before_id = 0
         await asyncio.sleep(min(args.poll_interval, max(0, deadline - time.monotonic())))
 
 

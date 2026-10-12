@@ -21,6 +21,9 @@ class CompatTests(unittest.TestCase):
     with sqlite3.connect(self.path) as connection:
       connection.execute("CREATE TABLE sessions (dc_id integer primary key, server_address text, port integer, auth_key blob, takeout_id integer)")
       connection.execute("INSERT INTO sessions VALUES (1, 'generic', 443, ?, NULL)", (b"fake-key",))
+      connection.execute("CREATE TABLE version (version integer primary key)")
+      # This fixture deliberately models the known v8/five-column mismatch.
+      connection.execute("INSERT INTO version VALUES (8)")
 
   def fake_telethon(self):
     class Client:
@@ -67,9 +70,55 @@ class CompatTests(unittest.TestCase):
   def test_unknown_schema_not_rewritten(self):
     with sqlite3.connect(self.path) as connection:
       connection.execute("CREATE TABLE sessions (unknown text)")
-    with patch.dict(sys.modules, {"telethon": self.fake_telethon()}):
+      connection.execute("CREATE TABLE version (version integer primary key)")
+      connection.execute("INSERT INTO version VALUES (8)")
+    with patch.dict(sys.modules, {"telethon": self.fake_telethon()}), self.assertRaises(ValueError):
       c.create_telegram_client(self.path, 123, "fake")
     self.assertEqual(c._read_session_columns(self.path), ("unknown",))
+
+  def test_actual_telethon_migrates_genuine_v7_and_keeps_auth_key(self):
+    from telethon.sessions import SQLiteSession
+    from telethon.crypto import AuthKey
+    session = SQLiteSession(str(self.path))
+    session.set_dc(1, "149.154.167.50", 443)
+    key = bytes(range(256))
+    session.auth_key = AuthKey(key)
+    session.close()
+    with sqlite3.connect(self.path) as connection:
+      connection.execute("ALTER TABLE sessions DROP COLUMN tmp_auth_key")
+      connection.execute("UPDATE version SET version=7")
+
+    async def construct():
+      # Constructing the real client/session is entirely offline.
+      client = c.create_telegram_client(self.path, 123, "fake")
+      actual_key = client.session.auth_key.key
+      await client.disconnect()
+      client.session.close()
+      return actual_key
+
+    self.assertEqual(asyncio.run(construct()), key)
+    self.assertEqual(c._read_session_columns(self.path), c.SUPPORTED_SESSION_COLUMNS)
+    with sqlite3.connect(self.path) as connection:
+      self.assertEqual(connection.execute("SELECT version FROM version").fetchone()[0], 8)
+
+  def test_future_session_version_rejected_without_changes(self):
+    self.database()
+    with sqlite3.connect(self.path) as connection:
+      connection.execute("UPDATE version SET version=9")
+    before = self.path.read_bytes()
+    with patch.dict(sys.modules, {"telethon": self.fake_telethon()}), self.assertRaises(ValueError):
+      c.create_telegram_client(self.path, 123, "fake")
+    self.assertEqual(self.path.read_bytes(), before)
+
+  def test_known_v7_six_columns_reconciles_version(self):
+    self.database()
+    with sqlite3.connect(self.path) as connection:
+      connection.execute("ALTER TABLE sessions ADD COLUMN tmp_auth_key blob")
+      connection.execute("UPDATE version SET version=7")
+    with patch.dict(sys.modules, {"telethon": self.fake_telethon()}):
+      c.create_telegram_client(self.path, 123, "fake")
+    with sqlite3.connect(self.path) as connection:
+      self.assertEqual(connection.execute("SELECT version FROM version").fetchone()[0], 8)
 
 
 if __name__ == "__main__":

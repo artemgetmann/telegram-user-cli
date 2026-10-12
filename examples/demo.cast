@@ -1,0 +1,10 @@
+{"version":2,"width":100,"height":24,"title":"Telegram User CLI: offline fixture replay","env":{"TERM":"xterm-256color","SHELL":"/bin/sh"}}
+[0,"o","OFFLINE FIXTURE DEMO. NO TELEGRAM CONNECTION OR REAL RECIPIENTS.\r\n"]
+[1.2,"o","\r\n"]
+[2.4,"o","$ telegram-user send --chat me --message-file message.txt\r\n"]
+[3.5999999999999996,"o","{\"message_id\": 123, \"text\": \"hello from my agent\\nliteral path: C:\\\\notes\\\\telegram.txt\\n\"}\r\n"]
+[4.8,"o","\r\n"]
+[6,"o","$ telegram-user read --chat me --limit 1\r\n"]
+[7.199999999999999,"o","{\"message_id\": 123, \"text\": \"hello from my agent\\nliteral path: C:\\\\notes\\\\telegram.txt\\n\"}\r\n"]
+[8.4,"o","\r\n"]
+[9.6,"o","Exact multiline text and literal backslashes survived send and readback.\r\n"]

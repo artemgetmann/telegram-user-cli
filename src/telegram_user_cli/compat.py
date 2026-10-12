@@ -52,12 +52,6 @@ def _read_session_columns(session_path: Path) -> tuple[str, ...] | None:
   return tuple(str(row[1]) for row in rows)
 
 
-def _needs_compat_copy(columns: tuple[str, ...] | None) -> bool:
-  if not columns:
-    return False
-  return set(LEGACY_SESSION_COLUMNS).issubset(columns) and set(columns).issubset(SUPPORTED_SESSION_COLUMNS)
-
-
 def _copy_session_database(source_path: Path, destination_path: Path) -> None:
   destination_path.parent.mkdir(parents = True, exist_ok = True)
   source = sqlite3.connect(f"file:{source_path}?mode=ro", uri = True)
@@ -71,54 +65,33 @@ def _copy_session_database(source_path: Path, destination_path: Path) -> None:
     source.close()
 
 
-def _rewrite_sessions_table(
-  session_path: Path,
-  *,
-  source_columns: tuple[str, ...],
-  target_columns: tuple[str, ...],
-) -> None:
-  select_columns = ", ".join(
-    column if column in source_columns else f"NULL AS {column}"
-    for column in target_columns
-  )
-  table_columns = ",\n          ".join(
-    {
-      "dc_id": "dc_id integer primary key",
-      "server_address": "server_address text",
-      "port": "port integer",
-      "auth_key": "auth_key blob",
-      "takeout_id": "takeout_id integer",
-      "tmp_auth_key": "tmp_auth_key blob",
-    }[column]
-    for column in target_columns
-  )
-  insert_columns = ",\n          ".join(target_columns)
+def _repair_session_schema(session_path: Path, *, target_version: int) -> None:
+  if not session_path.exists() or not session_path.is_file():
+    return
   connection = sqlite3.connect(session_path)
   try:
-    with connection:
-      # sqlite3 does not implicitly begin a transaction for DDL statements.
-      # Explicit BEGIN keeps rename/create/insert/drop atomic on any failure.
-      connection.execute("BEGIN IMMEDIATE")
-      connection.execute("ALTER TABLE sessions RENAME TO sessions_legacy")
-      connection.execute(
-        """
-        CREATE TABLE sessions (
-          {}
-        )
-        """.format(table_columns)
-      )
-      connection.execute(
-        """
-        INSERT INTO sessions (
-          {}
-        )
-        SELECT
-        """
-        .format(insert_columns)
-        + select_columns
-        + "\nFROM sessions_legacy"
-      )
-      connection.execute("DROP TABLE sessions_legacy")
+    row = connection.execute("SELECT version FROM version").fetchone()
+    if row is None or not isinstance(row[0], int):
+      raise ValueError("Unsupported Telegram session version metadata.")
+    version = row[0]
+    if version > target_version:
+      raise ValueError("Telegram session was created by a newer unsupported Telethon version.")
+    columns = tuple(str(row[1]) for row in connection.execute("PRAGMA table_info(sessions)"))
+    # Genuine historical versions belong to Telethon's native migration path.
+    # In particular, adding tmp_auth_key to v7 before its own v8 upgrade would
+    # cause duplicate-column errors. Only repair the two known mixed states.
+    if version == 7 and columns == SUPPORTED_SESSION_COLUMNS and target_version == 8:
+      with connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("UPDATE version SET version=8")
+    elif version == 8 and columns == LEGACY_SESSION_COLUMNS and target_version == 8:
+      with connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("ALTER TABLE sessions ADD COLUMN tmp_auth_key blob")
+    elif version >= 7 and columns != (SUPPORTED_SESSION_COLUMNS if version == 8 else LEGACY_SESSION_COLUMNS):
+      raise ValueError("Unsupported Telegram session schema; refusing to rewrite it.")
+  except sqlite3.Error as err:
+    raise ValueError("Unsupported Telegram session database metadata.") from err
   finally:
     connection.close()
 
@@ -139,8 +112,6 @@ def prepare_session_for_telethon(
   if not normalized_path.exists() or not normalized_path.is_file():
     return normalized_path, None
 
-  columns = _read_session_columns(normalized_path)
-
   temp_dir = tempfile.TemporaryDirectory(
     dir = normalized_path.parent,
     prefix = f".{normalized_path.stem}.telethon-compat-",
@@ -148,12 +119,7 @@ def prepare_session_for_telethon(
   compat_path = Path(temp_dir.name) / normalized_path.name
   try:
     _copy_session_database(normalized_path, compat_path)
-    if _needs_compat_copy(columns) and tuple(columns or ()) != target_columns:
-      _rewrite_sessions_table(
-        compat_path,
-        source_columns = columns,
-        target_columns = target_columns,
-      )
+    _repair_session_schema(compat_path, target_version=8 if target_columns == SUPPORTED_SESSION_COLUMNS else 7)
   except Exception:
     temp_dir.cleanup()
     raise
@@ -176,13 +142,13 @@ def create_telegram_client(
   normalized = Path(session_path).expanduser()
   target_columns = detect_expected_session_columns(telethon)
   if persistent:
-    # Login and transport clients must retain new auth keys and entity caches.
-    # Rewriting the known table in place is transactional; unknown schemas are
-    # left to Telethon rather than guessed or destructively downgraded.
+    # Login retains keys in the canonical file. Known genuine old versions
+    # migrate in Telethon; narrowly repair inconsistent version/schema pairs.
     normalized.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    columns = _read_session_columns(normalized)
-    if _needs_compat_copy(columns) and columns != target_columns:
-      _rewrite_sessions_table(normalized, source_columns=columns, target_columns=target_columns)
+    target_version = int(telethon.sessions.sqlite.CURRENT_VERSION)
+    if target_version not in (7, 8):
+      raise ValueError("Unsupported Telethon session version.")
+    _repair_session_schema(normalized, target_version=target_version)
     prepared_path, temp_dir = normalized, None
   else:
     prepared_path, temp_dir = prepare_session_for_telethon(normalized, target_columns=target_columns)
