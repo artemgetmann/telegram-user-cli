@@ -228,6 +228,98 @@ class BackendTests(unittest.TestCase):
       finally:
         os.close(write_fd)
 
+  def offline_login_call(self, responses, *, previous_generic_error=False):
+    from telethon import TelegramClient
+    args = self.args("login", "--phone", "+123")
+    observed = []
+    output, error = io.StringIO(), io.StringIO()
+
+    async def exercise():
+      client = None
+
+      def factory(path, api_id, api_hash, **kwargs):
+        nonlocal client
+        # Real Telethon auth.send_code_request and users._call run against a
+        # fake future-producing sender. No socket or live session is opened.
+        client = TelegramClient(None, api_id, api_hash, **kwargs)
+        if previous_generic_error:
+          client._raise_last_call_error = False
+        client.connect = AsyncMock()
+        client.disconnect = AsyncMock()
+        client.is_user_authorized = AsyncMock(return_value=False)
+        client.session.set_dc(1, "generic", 443)
+
+        def send(request, ordered=False):
+          observed.append((client.session.dc_id, request))
+          future = asyncio.get_running_loop().create_future()
+          response = responses[len(observed) - 1]
+          if isinstance(response, type) and issubclass(response, Exception):
+            future.set_exception(response(request=request, capture=len(observed) + 1))
+          elif isinstance(response, Exception):
+            future.set_exception(response)
+          else:
+            future.set_result(response)
+          return future
+
+        async def switch(dc):
+          client.session.set_dc(dc, "generic", 443)
+
+        client._sender = SimpleNamespace(send=send)
+        client._switch_dc = AsyncMock(side_effect=switch)
+        return client
+
+      with patch.object(b, "resolve_api_credentials", return_value=(123, "fake")), patch.object(b, "create_telegram_client", side_effect=factory):
+        result = await b.run(args)
+      return result, client
+
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+      result, client = asyncio.run(exercise())
+    return result, output.getvalue(), error.getvalue(), observed, client
+
+  def test_real_telethon_login_dc_redirect_finishes_same_attempt(self):
+    from telethon import errors, types
+    for migration in (errors.PhoneMigrateError, errors.NetworkMigrateError, errors.UserMigrateError):
+      with self.subTest(migration=migration):
+        b.clear_pending_auth_state(Path(self.session))
+        response = types.auth.SentCode(types.auth.SentCodeTypeSms(5), "generic-hash")
+        status, output, error, calls, client = self.offline_login_call([migration, response])
+        self.assertEqual((status, error), (0, ""))
+        self.assertEqual(json.loads(output)["state"], "awaiting_code")
+        self.assertEqual(b.read_pending_auth_state(Path(self.session))["phone_code_hash"], "generic-hash")
+        self.assertEqual([dc for dc, _ in calls], [1, 2])
+        self.assertTrue(all(isinstance(request, b.functions.auth.SendCodeRequest) for _, request in calls))
+        client._switch_dc.assert_awaited_once_with(2)
+        self.assertEqual(client._request_retries, 0)
+        self.assertTrue(client._raise_last_call_error)
+        client.disconnect.assert_awaited_once()
+
+  def test_previous_generic_error_loses_redirect_before_code_is_requested(self):
+    from telethon import errors
+    status, output, error, calls, client = self.offline_login_call([errors.PhoneMigrateError], previous_generic_error=True)
+    self.assertEqual((status, output), (1, ""))
+    self.assertIn("Request was unsuccessful", json.loads(error)["error"]["message"])
+    self.assertEqual(len(calls), 1)
+    client._switch_dc.assert_awaited_once_with(2)
+    self.assertIsNone(b.read_pending_auth_state(Path(self.session)))
+
+  def test_real_telethon_repeated_dc_redirect_stops_after_two_requests(self):
+    from telethon import errors
+    status, output, error, calls, client = self.offline_login_call([errors.PhoneMigrateError, errors.PhoneMigrateError])
+    self.assertEqual((status, output), (1, ""))
+    self.assertEqual(json.loads(error)["error"]["code"], "E_TELEGRAM_USER_BACKEND")
+    self.assertEqual(len(calls), 2)
+    self.assertEqual(client._switch_dc.await_count, 2)
+    self.assertIsNone(b.read_pending_auth_state(Path(self.session)))
+
+  def test_real_telethon_login_nonmigration_failures_are_never_retried(self):
+    from telethon import errors
+    for failure in (errors.FloodWaitError(request=None, capture=20), errors.ServerError(request=None, message="generic"), errors.TimedOutError(request=None, message="generic")):
+      with self.subTest(failure=type(failure).__name__), patch("telethon.client.users.asyncio.sleep", AsyncMock()):
+        _, _, _, calls, client = self.offline_login_call([failure])
+        self.assertEqual(len(calls), 1)
+        client._switch_dc.assert_not_awaited()
+        self.assertIsNone(b.read_pending_auth_state(Path(self.session)))
+
 
 if __name__ == "__main__":
   unittest.main()

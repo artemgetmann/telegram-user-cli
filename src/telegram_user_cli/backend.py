@@ -41,10 +41,17 @@ except Exception:  # pragma: no cover - POSIX fallback
 from .compat import create_telegram_client
 
 try:
-  from telethon import functions, utils
+  from telethon import functions, utils, errors
 except Exception:  # pragma: no cover - import failure is reported by command execution
   functions = None
   utils = None
+  errors = None
+
+# These errors mean the wrong data center rejected the authorization request.
+# Retrying that one request after Telethon switches DC cannot duplicate a send.
+DC_MIGRATION_ERRORS = (
+  errors.PhoneMigrateError, errors.NetworkMigrateError, errors.UserMigrateError,
+) if errors is not None else ()
 
 
 # Resolve the default at invocation time so changing XDG_DATA_HOME before a
@@ -270,7 +277,14 @@ async def refresh_pending_code_request(
   *,
   phone: str,
 ) -> dict[str, object]:
-  sent = await client.send_code_request(phone)
+  try:
+    sent = await client.send_code_request(phone)
+  except DC_MIGRATION_ERRORS:
+    # With zero internal retries, pinned Telethon switches DC then re-raises
+    # the typed rejection when raise_last_call_error is enabled. Allow exactly
+    # one retry for this rejected OTP request; repeated redirects and all
+    # server/flood/timeout failures escape without another request.
+    sent = await client.send_code_request(phone)
   return write_pending_auth_state(
     session_path,
     phone = phone,
@@ -1177,6 +1191,7 @@ async def run_login(args: argparse.Namespace) -> int:
       flood_sleep_threshold = 0,
       request_retries = 0,
       connection_retries = 0,
+      raise_last_call_error = True,
     )
     try:
       await client.connect()
