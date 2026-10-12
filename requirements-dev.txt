@@ -1,0 +1,7 @@
+# Exact versions for the release's test/build environment.
+Telethon==1.43.2
+python-dotenv==1.2.1
+build==1.3.0
+ruff==0.14.0
+setuptools==80.9.0
+wheel==0.45.1

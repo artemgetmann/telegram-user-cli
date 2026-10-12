@@ -1,0 +1,5 @@
+feat(cli): describe the change
+
+- What: concrete change
+- Why: reason for the change
+- Risk: material behavior or proof boundary

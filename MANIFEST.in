@@ -1,0 +1,4 @@
+include .env.example LICENSE PROVENANCE.md VISION.md AGENTS.md requirements-dev.txt
+recursive-include docs *.md
+recursive-include src *.md
+recursive-include tests *.py
