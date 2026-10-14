@@ -6,6 +6,12 @@ Let your agent read and send messages through your own Telegram account.
 It works with any agent that can run shell commands. No OpenClaw gateway or background
 service is required. Operations return JSON, including message IDs for readback and replies.
 
+```mermaid
+flowchart LR
+    agent["Your agent"] <-->|Commands / JSON| cli["telegram-user CLI"]
+    cli <-->|Read / send| account["Your Telegram account<br/>DMs and forum topics"]
+```
+
 ## Install
 
 Python 3.10 or later. macOS and Linux are the initial supported platforms.
