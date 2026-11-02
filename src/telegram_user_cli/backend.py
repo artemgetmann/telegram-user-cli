@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import io
 import os
@@ -62,6 +62,7 @@ PENDING_AUTH_SUFFIX = ".login.json"
 LOGIN_PASSWORD_ENV = "TELEGRAM_USER_LOGIN_PASSWORD"
 SESSION_LOCK_PATH_ENV = "TELEGRAM_USER_LOCK_PATH"
 MAX_INPUT_BYTES = 4 * 1024 * 1024
+MAX_INBOX_OUTPUT_BYTES = 4 * 1024 * 1024 - 4096
 # Validate the original button value with one ASCII-only grammar. Component URL
 # parsers may erase empty `?`/`#` delimiters, trim leading controls, or normalize
 # host casing before callers can decide whether the provider URL was canonical.
@@ -148,6 +149,8 @@ def resolve_session_path(explicit: str | None) -> Path:
   # Telethon appends .session itself; normalize first so database, pending auth
   # and lock selectors always refer to the same exact persisted path.
   path = Path(raw).expanduser()
+  if not path.is_absolute():
+    raise ValueError("Telegram user session path must be absolute.")
   if path.suffix != ".session":
     path = Path(str(path) + ".session")
   return path.resolve()
@@ -308,18 +311,23 @@ def resolve_session_lock_path(explicit: str | Path | None = None, *, session_pat
   return Path(str(resolved) + ".lock")
 
 
-def resolve_session_lock_paths(session_path: Path, lock_path_override: str | Path | None = None) -> list[Path]:
+def resolve_session_lock_paths(session_path: Path, lock_path_override: str | Path | None = None, *, shared_locks=()) -> list[Path]:
   # Always retain the per-session lock, even with an override. An override must
   # not allow two clients of the same SQLite session to run concurrently.
   paths = {Path(str(session_path.resolve()) + ".lock"), resolve_session_lock_path(lock_path_override, session_path=session_path)}
+  for raw in shared_locks or ():
+    selected = Path(raw).expanduser()
+    if not selected.is_absolute():
+      raise ValueError("Shared session lock paths must be absolute.")
+    paths.add(selected.resolve())
   return sorted(paths, key=str)
 
 
 @contextmanager
-def acquire_session_locks(session_paths: list[Path], timeout_seconds: int = DEFAULT_LOCK_TIMEOUT_SECONDS, *, lock_path_override=None):
+def acquire_session_locks(session_paths: list[Path], timeout_seconds: int = DEFAULT_LOCK_TIMEOUT_SECONDS, *, lock_path_override=None, shared_locks=()):
   if fcntl is None and msvcrt is None:
     raise RuntimeError("Session locking is unavailable on this operating system.")
-  paths = sorted({p for session in session_paths for p in resolve_session_lock_paths(session, lock_path_override)}, key=str)
+  paths = sorted({p for session in session_paths for p in resolve_session_lock_paths(session, lock_path_override, shared_locks=shared_locks)}, key=str)
   deadline = time.monotonic() + max(0, timeout_seconds)
   acquired = []
   with ExitStack() as stack:
@@ -359,13 +367,13 @@ def acquire_session_locks(session_paths: list[Path], timeout_seconds: int = DEFA
 
 
 @contextmanager
-def acquire_session_lock(session_path: Path, timeout_seconds: int = DEFAULT_LOCK_TIMEOUT_SECONDS, *, lock_path_override=None):
-  with acquire_session_locks([session_path], timeout_seconds, lock_path_override=lock_path_override):
+def acquire_session_lock(session_path: Path, timeout_seconds: int = DEFAULT_LOCK_TIMEOUT_SECONDS, *, lock_path_override=None, shared_locks=()):
+  with acquire_session_locks([session_path], timeout_seconds, lock_path_override=lock_path_override, shared_locks=shared_locks):
     yield
 
 
 @asynccontextmanager
-async def acquire_session_lock_async(session_path: Path, timeout_seconds=DEFAULT_LOCK_TIMEOUT_SECONDS, *, lock_path_override=None):
+async def acquire_session_lock_async(session_path: Path, timeout_seconds=DEFAULT_LOCK_TIMEOUT_SECONDS, *, lock_path_override=None, shared_locks=()):
   # Runtime locking must yield while another process owns SQLite. This keeps
   # the outer RPC deadline and cancellation effective without worker threads.
   if fcntl is None and msvcrt is None:
@@ -374,7 +382,7 @@ async def acquire_session_lock_async(session_path: Path, timeout_seconds=DEFAULT
   acquired = []
   with ExitStack() as stack:
     try:
-      for path in resolve_session_lock_paths(session_path, lock_path_override):
+      for path in resolve_session_lock_paths(session_path, lock_path_override, shared_locks=shared_locks):
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         handle = stack.enter_context(open(path, "a+", encoding="utf-8"))
         os.chmod(path, 0o600)
@@ -925,8 +933,16 @@ def validate_args(args):
     value = getattr(args, name, 0)
     if value is not None and int(value) < 0:
       raise ValueError(f"--{name.replace('_', '-')} must be positive when supplied.")
-  if getattr(args, "limit", 0) > 200:
-    raise ValueError("--limit must be at most 200.")
+  scan_limit = getattr(args, "scan_limit", None)
+  if scan_limit is not None and not 1 <= scan_limit <= 5000:
+    raise ValueError("--scan-limit must be between 1 and 5000.")
+  maximum = 5000 if args.command == "inbox" and scan_limit is not None else 200
+  if getattr(args, "limit", 0) > maximum:
+    raise ValueError(f"--limit must be at most {maximum}.")
+  # Validate every explicit lock before credentials, network, or lock creation.
+  for raw in (getattr(args, "shared_lock", None) or ()):
+    if not Path(raw).expanduser().is_absolute():
+      raise ValueError("Shared session lock paths must be absolute.")
   if getattr(args, "after_id", 0) and getattr(args, "before_id", 0) and args.after_id >= args.before_id:
     raise ValueError("--after-id must be less than --before-id.")
   if getattr(args, "topic_anchor", None) and getattr(args, "reply_to", 0):
@@ -954,6 +970,8 @@ def build_parser() -> argparse.ArgumentParser:
     "--lock",
     help = "Session lock path override for a separate account or hermetic test",
   )
+  parser.add_argument("--shared-lock", action="append", default=[],
+                      help="Also acquire this explicit absolute lock; repeat for mixed-client adoption")
   subparsers = parser.add_subparsers(dest = "command", required = True)
 
   status = subparsers.add_parser("status", help = "Inspect login/session health")
@@ -1038,6 +1056,7 @@ def build_parser() -> argparse.ArgumentParser:
 
   inbox = subparsers.add_parser("inbox", help = "List dialogs with unread metadata")
   inbox.add_argument("--limit", type = int, default = 20, help = "Maximum number of dialogs")
+  inbox.add_argument("--scan-limit", type=int, help="Opt-in scan budget 1..5000, including lookahead")
   inbox.add_argument("--unread", action = "store_true", help = "Only include unread dialogs")
   inbox.add_argument("--dm-only", action = "store_true", help = "Only include direct messages")
   inbox.add_argument("--contains", default = "", help = "Only include matching title, username, or last text")
@@ -1081,7 +1100,7 @@ async def run_precheck(args: argparse.Namespace) -> int:
       details = {"session_path": str(session_path)},
     )
 
-  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None), shared_locks=getattr(args, "shared_lock", ())):
     client, me = await connect_client(session_path)
     try:
       chat_payload = None
@@ -1115,7 +1134,7 @@ async def run_status(args: argparse.Namespace) -> int:
     )
 
   if session_path.exists():
-    async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
+    async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None), shared_locks=getattr(args, "shared_lock", ())):
       api_id, api_hash = resolve_api_credentials()
       client = create_telegram_client(
         session_path,
@@ -1182,7 +1201,7 @@ async def run_login(args: argparse.Namespace) -> int:
   if not phone:
     return fail("E_USAGE", "Telegram login requires --phone.")
 
-  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None), shared_locks=getattr(args, "shared_lock", ())):
     api_id, api_hash = resolve_api_credentials()
     client = create_telegram_client(
       session_path,
@@ -1350,7 +1369,7 @@ async def run_send(args: argparse.Namespace) -> int:
   reply_to = getattr(args, "topic_anchor", None) or args.reply_to or None
   if not message_text.strip() and not media:
     return fail("E_USAGE", "Telegram send requires --message or --media.")
-  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None), shared_locks=getattr(args, "shared_lock", ())):
     client, _ = await connect_client(session_path)
     try:
       # Resolve once so send and the acknowledgement apply to exactly the same
@@ -1419,7 +1438,7 @@ async def run_topic_create(args: argparse.Namespace) -> int:
   title = str(args.title or "").strip()
   if not title:
     return fail("E_USAGE", "Telegram topic-create requires --title.")
-  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None), shared_locks=getattr(args, "shared_lock", ())):
     client, _ = await connect_client(session_path)
     try:
       updates = await client(
@@ -1446,7 +1465,7 @@ async def run_topic_delete(args: argparse.Namespace) -> int:
   topic_anchor = int(args.topic_anchor or 0)
   if topic_anchor <= 0:
     return fail("E_USAGE", "Telegram topic-delete requires --topic-anchor.")
-  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None), shared_locks=getattr(args, "shared_lock", ())):
     client, _ = await connect_client(session_path)
     try:
       result = await client(
@@ -1473,7 +1492,7 @@ async def run_topic_resolve(args: argparse.Namespace) -> int:
   title = str(args.title or "").strip()
   if not title:
     return fail("E_USAGE", "Telegram topic-resolve requires --title.")
-  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None), shared_locks=getattr(args, "shared_lock", ())):
     client, _ = await connect_client(session_path)
     try:
       # Telegram applies q server-side. The exact normalized comparison below
@@ -1575,7 +1594,7 @@ async def run_read(args: argparse.Namespace) -> int:
   topic_anchor = int(topic_anchor_raw or 0)
   if topic_anchor_raw is not None and topic_anchor <= 0:
     return fail("E_USAGE", "Telegram read --topic-anchor must be a positive integer.")
-  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None), shared_locks=getattr(args, "shared_lock", ())):
     client, _ = await connect_client(session_path)
     try:
       chat = resolve_chat(args.chat)
@@ -1728,7 +1747,7 @@ async def run_read(args: argparse.Namespace) -> int:
 
 async def run_mark_read(args: argparse.Namespace) -> int:
   session_path = resolve_session_path(args.session)
-  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None), shared_locks=getattr(args, "shared_lock", ())):
     client, _ = await connect_client(session_path)
     try:
       # Omitting a message/max_id tells Telethon to acknowledge the current
@@ -1743,7 +1762,7 @@ async def run_mark_unread(args: argparse.Namespace) -> int:
   if functions is None:
     return fail("E_TELETHON_IMPORT", "Telethon dialog read-state functions are unavailable.")
   session_path = resolve_session_path(args.session)
-  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None), shared_locks=getattr(args, "shared_lock", ())):
     client, _ = await connect_client(session_path)
     try:
       # Telegram models this as a dialog-level unread flag, not as rewinding
@@ -1768,7 +1787,7 @@ async def run_download(args: argparse.Namespace) -> int:
   if not output_raw:
     return fail("E_USAGE", "Telegram download requires --output.")
 
-  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None), shared_locks=getattr(args, "shared_lock", ())):
     client, _ = await connect_client(session_path)
     try:
       message = await client.get_messages(resolve_chat(args.chat), ids = message_id)
@@ -1814,7 +1833,7 @@ async def run_button_click(args: argparse.Namespace) -> int:
     )
 
   expected_callback_bytes = callback_data.encode("utf-8")
-  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None), shared_locks=getattr(args, "shared_lock", ())):
     client, _ = await connect_client(session_path)
     try:
       # Fetch by explicit id from the explicit chat. Never scan recent history:
@@ -1901,32 +1920,60 @@ async def run_button_click(args: argparse.Namespace) -> int:
 
 
 async def run_inbox(args: argparse.Namespace) -> int:
+  # Keep legacy defaults; explicit scan coverage opts into larger result limits.
+  validate_args(args)
+  scan_limit = getattr(args, "scan_limit", None)
+  observed_start = datetime.now(timezone.utc).isoformat()
   session_path = resolve_session_path(args.session)
-  limit = max(1, min(int(args.limit or 20), 200))
+  limit = int(args.limit) if scan_limit is not None else max(1, min(int(args.limit or 20), 200))
   contains = str(args.contains or "")
-  async with acquire_session_lock_async(session_path, lock_path_override = getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override=getattr(args, "lock", None), shared_locks=getattr(args, "shared_lock", ())):
     client, _ = await connect_client(session_path)
     try:
       dialogs = []
-      scan_cap = compute_inbox_scan_cap(
-        contains = contains,
-        limit = limit,
-        dm_only = bool(args.dm_only),
-        unread_only = bool(args.unread),
+      scan_cap = scan_limit if scan_limit is not None else compute_inbox_scan_cap(
+        contains=contains, limit=limit, dm_only=bool(args.dm_only), unread_only=bool(args.unread),
       )
-      # Keep the scan bounded, but do not assume the first few hundred dialogs are
-      # representative once filters are applied client-side.
-      async for dialog in client.iter_dialogs(limit = scan_cap, ignore_pinned = False):
-        if not dialog_matches_inbox_filters(
-          dialog,
-          contains = contains,
-          dm_only = bool(args.dm_only),
-          unread_only = bool(args.unread),
-        ):
-          continue
-        dialogs.append(build_dialog_payload(dialog))
-        if len(dialogs) >= limit:
+      scanned = 0
+      output_bytes = 0
+      stop_reason = "exhausted"
+      # A lookahead consumes the same budget. Reaching a budget is not proof
+      # of exhaustion, even if it happens to coincide with the provider's end.
+      async for dialog in client.iter_dialogs(limit=scan_cap, ignore_pinned=False):
+        scanned += 1
+        if scan_limit is not None and len(dialogs) >= limit:
+          stop_reason = "result_limit"
           break
+        if not dialog_matches_inbox_filters(
+          dialog, contains=contains, dm_only=bool(args.dm_only), unread_only=bool(args.unread),
+        ):
+          if scan_limit is not None and scanned >= scan_cap:
+            stop_reason = "scan_limit"
+            break
+          continue
+        row = build_dialog_payload(dialog)
+        if scan_limit is not None:
+          peer_type = "user" if dialog.is_user else "channel" if dialog.is_channel else "chat"
+          # chat_id stays Telethon's marked ID, directly reusable by read/send.
+          # The typed identity uses the bare ID to match the reviewed contract.
+          row["peer_type"] = peer_type
+          row["peer_id"] = f"{peer_type}:{dialog.entity.id}"
+          row_bytes = len(json.dumps(row, ensure_ascii=True)) + 2
+          if output_bytes + row_bytes > MAX_INBOX_OUTPUT_BYTES:
+            stop_reason = "output_limit"
+            break
+          output_bytes += row_bytes
+        dialogs.append(row)
+        if scan_limit is not None and scanned >= scan_cap:
+          stop_reason = "scan_limit"
+          break
+        if scan_limit is None and len(dialogs) >= limit:
+          break
+      if scan_limit is not None:
+        return emit({"dialogs": dialogs, "scanned_count": scanned,
+          "returned_count": len(dialogs), "result_limit": limit, "scan_limit": scan_limit,
+          "exhausted": stop_reason == "exhausted", "stop_reason": stop_reason,
+          "observed_start": observed_start, "observed_end": datetime.now(timezone.utc).isoformat()})
       return emit({"dialogs": dialogs})
     finally:
       await client.disconnect()
@@ -1934,7 +1981,7 @@ async def run_inbox(args: argparse.Namespace) -> int:
 
 async def run_logout(args: argparse.Namespace) -> int:
   session_path = resolve_session_path(args.session)
-  async with acquire_session_lock_async(session_path, lock_path_override=getattr(args, "lock", None)):
+  async with acquire_session_lock_async(session_path, lock_path_override=getattr(args, "lock", None), shared_locks=getattr(args, "shared_lock", ())):
     removed_paths = clear_session_artifacts(session_path)
   return emit({"cleared": bool(removed_paths), "removed_paths": removed_paths, "session_path": str(session_path)})
 

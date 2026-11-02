@@ -53,3 +53,18 @@ If a mutation times out, disconnects, or reports a send acknowledgement failure,
 it may already have succeeded. Read the exact target before considering a retry.
 Never automatically resend. Report delivery and dialog read-state as separate outcomes
 when one succeeds and the other fails.
+
+## Bounded triage and existing-account adoption
+
+For an authorized broad sweep, use `inbox --unread --scan-limit 5000 --limit 5000`.
+Report the filters, observation interval, and coverage fields. Only `exhausted=true`
+proves dialog enumeration completed; scan, result, and output limits mean partial
+coverage, including zero-match results. Do not silently widen or repeat a sweep.
+Use marked `chat_id` for later commands, not the typed `peer_id` identity label.
+`read --format compact` is available for context; raw reads retain exact whitespace.
+
+Adoption requires explicit owner-approved account/session and credential selectors.
+Use absolute session paths. Where clients share account state, supply every confirmed
+transition lock through repeated `--shared-lock` flags. Do not infer those paths,
+copy sessions, migrate pending login state, or change callers without cutover approval.
+See `docs/adoption.md` in the source project for proof limits and rollout gates.
