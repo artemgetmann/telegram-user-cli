@@ -12,3 +12,9 @@
 - Logout clears only the exact selected local session artifacts. It does not
   promise to revoke every Telegram device or remote authorization.
 - Tests use isolated files and fake clients. No tests contact real recipients.
+
+- Session selectors must be absolute after expanding `~`; no cwd-based account selection.
+- Repeated explicit `--shared-lock` paths add transition locks without removing the
+  canonical standalone session lock. Lock identities are resolved, sorted, and deduplicated.
+- No legacy pending-login state is adopted automatically; mixed login/logout is not
+  part of the shared-lock bridge. See `../../adoption.md` for the cutover gates.

@@ -100,6 +100,24 @@ Other commands: `precheck`, `topic-create`, `topic-delete`, `mark-read`, `mark-u
 `skill` prints the bundled agent instructions. `doctor` checks local setup without
 network access; `status` checks actual authentication with Telegram.
 
+## Bounded inbox coverage (local candidate)
+
+`inbox --scan-limit 5000 --limit 5000 --unread --json` opts into bounded coverage.
+The result reports `scanned_count`, `returned_count`, both limits, a UTC observation
+interval, `exhausted`, and `stop_reason` (`exhausted`, `scan_limit`, `result_limit`,
+or `output_limit`). Reaching a budget never proves full enumeration. Without
+`--scan-limit`, the existing result shape and limits remain unchanged.
+Typed `peer_id` values identify namespaces; keep using marked `chat_id` for commands.
+
+`read --format compact` prints the existing compact agent view; append `--json`
+for its compact JSON projection. Default reads still return raw JSON and exact text.
+Explicit session paths must be absolute. Repeated `--shared-lock /absolute/path`
+options can serialize access with another client using those same lock files;
+they never discover or adopt another application's account automatically.
+
+See the [adoption checklist and gated rollout](docs/adoption.md) before changing
+an installed caller. These source changes do not perform a cutover.
+
 ## Connect an agent
 
 Give your agent the output of `telegram-user skill`, or the bundled
@@ -122,7 +140,7 @@ An [asciinema replay](examples/demo.cast) of the same fixture output is also inc
 
 ## Output and failure behavior
 
-Success is one JSON record on stdout. Errors are JSON on stderr with a nonzero exit.
+Success is one JSON record on stdout (except explicit compact text reads). Errors are JSON on stderr with a nonzero exit.
 `--json` is accepted for clarity, but JSON is already the default. The `skill` command
 prints Markdown instead. `--rpc-timeout` bounds each operation; `wait --timeout` bounds
 the overall wait. `wait` returns `matched: false, timed_out: true` when no reply arrives.

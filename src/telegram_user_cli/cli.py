@@ -33,13 +33,13 @@ def normalize_globals(argv: list[str]) -> list[str]:
     Only recognized option tokens are moved. Values are consumed with their
     option, so a message that looks like a global flag remains literal text.
     """
-    takes_value = {"--session", "--lock", "--env-file", "--rpc-timeout"}
+    takes_value = {"--session", "--lock", "--env-file", "--rpc-timeout", "--shared-lock"}
     local_values = {
         "--chat", "--message", "--message-file", "--caption", "--caption-file",
         "--media", "--reply-to", "--topic-anchor", "--title", "--limit",
         "--after-id", "--before-id", "--contains", "--phone", "--secret-stdin",
         "--message-id", "--output", "--button-text", "--expected-callback-data",
-        "--expected-url", "--sender-id", "--timeout", "--poll-interval",
+        "--expected-url", "--sender-id", "--timeout", "--poll-interval", "--scan-limit", "--format",
     }
     global_args: list[str] = []
     local_args: list[str] = []
@@ -71,6 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Extend the transport's parser rather than duplicating its argument contract.
     commands = next(action for action in parser._actions
                     if isinstance(action, argparse._SubParsersAction))
+    commands.choices["read"].add_argument("--format", choices=["raw", "compact"], default="raw",
+                                       help="Compact OpenClaw-compatible read view; --json selects compact JSON")
     commands.add_parser("doctor", help="Explain local setup without network access")
     commands.add_parser("skill", help="Print the bundled agent instructions")
     wait = commands.add_parser("wait", help="Wait for a new message in one exact chat")
@@ -200,6 +202,48 @@ async def wait_for_message(args: argparse.Namespace) -> int:
         await asyncio.sleep(min(args.poll_interval, max(0, deadline - time.monotonic())))
 
 
+def compact_read(result: dict, chat: str) -> dict:
+    messages = []
+    for row in result.get("messages", []):
+        topic = row.get("direct_messages_topic") or {}
+        messages.append({
+            "buttons": row.get("inline_buttons") or [], "date": row.get("date"),
+            "dir": "out" if row.get("out") else "in", "id": row["message_id"],
+            "media": row.get("media_kind"), "reply_to": row.get("reply_to_msg_id"),
+            "sender": row.get("sender_id"), "text": " ".join(row.get("text", "").split()),
+            "top": row.get("reply_to_top_id"),
+            "topic": topic.get("topic_id", row.get("direct_messages_topic_id")),
+        })
+    ids = [row["id"] for row in messages]
+    return {"chat": chat, "messages": messages, "order": "newest_first",
+            "paging": {"newer_after_id": max(ids) if ids else None,
+                       "older_before_id": min(ids) if ids else None},
+            **({"topic": result["topic"]} if result.get("topic") else {})}
+
+
+def print_compact_read(result: dict) -> None:
+    rows = result["messages"]
+    print(f"Telegram user read compact. chat={result['chat']} messages={len(rows)} order=newest-first")
+    if result.get("topic"):
+        topic = result["topic"]
+        print(f"Topic: anchor={topic['topic_anchor']} title={json.dumps(topic['topic_title'], ensure_ascii=False)}")
+    for row in rows:
+        fields = []
+        for key in ("id", "date", "dir", "sender", "reply_to", "top", "topic", "media", "buttons", "text"):
+            value = row[key]
+            if key in ("buttons", "text"):
+                value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            elif value is None or value == "":
+                value = "-"
+            fields.append(f"{key}={value}")
+        print(" ".join(fields))
+    if not rows:
+        print("No Telegram user messages matched the requested range.")
+    else:
+        paging = result["paging"]
+        print(f"Paging: newer --after-id {paging['newer_after_id']} | older --before-id {paging['older_before_id']}")
+
+
 async def dispatch(args: argparse.Namespace) -> int:
     if args.command == "doctor":
         return doctor(args)
@@ -207,6 +251,15 @@ async def dispatch(args: argparse.Namespace) -> int:
         print(Path(__file__).with_name("SKILL.md").read_text(encoding="utf-8"), end="")
         return 0
     load_credentials(args.env_file)
+    if args.command == "read" and args.format == "compact":
+        code, result = await capture(args)
+        if code:
+            return code
+        compact = compact_read(result, args.chat)
+        if args.json:
+            return backend.emit(compact)
+        print_compact_read(compact)
+        return 0
     if args.command == "wait":
         return await wait_for_message(args)
     if args.command == "login" and not args.secret_stdin and sys.stdin.isatty():
