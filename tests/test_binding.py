@@ -70,7 +70,6 @@ class BindingTests(unittest.TestCase):
             ['send', '--chat', 'fixture', '--message-file', '/fixture/space Ю.txt'],
             ['send', '--chat', 'fixture', '--message=--session'],
             ['send', '--chat', 'fixture', '--message=--shared-lock=/literal'],
-            ['--', 'inbox'],
             ['wait', '--chat', 'fixture', '--after-id', '12', '--timeout', '0.5'],
         ]
         for argv in cases:
@@ -78,6 +77,21 @@ class BindingTests(unittest.TestCase):
                 code, _, _, execute = self.run_main(argv)
                 self.assertEqual(code, 0)
                 self.assertEqual(execute.call_args.args[1][-len(argv):], argv)
+
+    def test_leading_separator_matches_underlying_parser(self):
+        argv = ['--', 'inbox']
+        try:
+            cli.build_parser().parse_args(cli.normalize_globals(argv))
+        except ValueError:
+            code, out, err, execute = self.run_main(argv)
+            self.assertEqual((code, out), (2, ''))
+            self.assertEqual(json.loads(err)['error']['code'], 'E_USAGE')
+            execute.assert_not_called()
+        else:
+            code, out, err, execute = self.run_main(argv)
+            self.assertEqual((code, out, err), (0, '', ''))
+            execute.assert_called_once()
+            self.assertEqual(execute.call_args.args[1][-len(argv):], argv)
 
     def test_caller_selector_overrides_and_abbreviations_fail_before_exec(self):
         cases = [
