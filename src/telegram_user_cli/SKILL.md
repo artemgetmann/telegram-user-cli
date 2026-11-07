@@ -9,6 +9,14 @@ Use `telegram-user` for the account owner's authorized Telegram operations.
 It requires an existing installation and owner-provided API credentials and login.
 Read `telegram-user --help` and the relevant command's help if syntax is uncertain.
 
+If the operator has explicitly configured `telegram-user-bound`, prefer that named
+entrypoint consistently for execution against its selected account. It uses the same
+command arguments but refuses account/session/lock overrides. Discover it with
+`telegram-user-bound --help`; validate only configuration with `--check-binding`.
+Do not fall back to unbound defaults when a binding is missing or invalid. The binding
+file holds path references only, never credential values. Commands shown below use
+the underlying CLI name; substitute the configured bound entrypoint when selected.
+
 ## Workflow
 
 1. Run `telegram-user doctor` for local setup. `status` verifies actual authentication.

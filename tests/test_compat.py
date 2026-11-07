@@ -1,4 +1,5 @@
 """SQLite and fake-Telethon persistence checks without contacting Telegram."""
+from contextlib import closing
 import asyncio
 import sqlite3
 import sys
@@ -18,7 +19,7 @@ class CompatTests(unittest.TestCase):
     self.path = Path(self.directory.name) / "user.session"
 
   def database(self):
-    with sqlite3.connect(self.path) as connection:
+    with closing(sqlite3.connect(self.path)) as connection, connection:
       connection.execute("CREATE TABLE sessions (dc_id integer primary key, server_address text, port integer, auth_key blob, takeout_id integer)")
       connection.execute("INSERT INTO sessions VALUES (1, 'generic', 443, ?, NULL)", (b"fake-key",))
       connection.execute("CREATE TABLE version (version integer primary key)")
@@ -33,7 +34,7 @@ class CompatTests(unittest.TestCase):
         return None
       def sign_in(self):
         # Model Telethon persisting authentication in its selected database.
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
           connection.execute("UPDATE sessions SET auth_key=?", (b"new-key",))
     return SimpleNamespace(TelegramClient=Client, sessions=SimpleNamespace(sqlite=SimpleNamespace(CURRENT_VERSION=8)))
 
@@ -45,7 +46,7 @@ class CompatTests(unittest.TestCase):
       client.sign_in()
       asyncio.run(client.disconnect())
     self.assertEqual(c._read_session_columns(self.path), c.SUPPORTED_SESSION_COLUMNS)
-    with sqlite3.connect(self.path) as connection:
+    with closing(sqlite3.connect(self.path)) as connection, connection:
       self.assertEqual(connection.execute("SELECT auth_key FROM sessions").fetchone()[0], b"new-key")
     self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
@@ -68,7 +69,7 @@ class CompatTests(unittest.TestCase):
     self.assertFalse(hasattr(client, "_telegram_user_compat_session_path"))
 
   def test_unknown_schema_not_rewritten(self):
-    with sqlite3.connect(self.path) as connection:
+    with closing(sqlite3.connect(self.path)) as connection, connection:
       connection.execute("CREATE TABLE sessions (unknown text)")
       connection.execute("CREATE TABLE version (version integer primary key)")
       connection.execute("INSERT INTO version VALUES (8)")
@@ -84,7 +85,7 @@ class CompatTests(unittest.TestCase):
     key = bytes(range(256))
     session.auth_key = AuthKey(key)
     session.close()
-    with sqlite3.connect(self.path) as connection:
+    with closing(sqlite3.connect(self.path)) as connection, connection:
       connection.execute("ALTER TABLE sessions DROP COLUMN tmp_auth_key")
       connection.execute("UPDATE version SET version=7")
 
@@ -98,12 +99,12 @@ class CompatTests(unittest.TestCase):
 
     self.assertEqual(asyncio.run(construct()), key)
     self.assertEqual(c._read_session_columns(self.path), c.SUPPORTED_SESSION_COLUMNS)
-    with sqlite3.connect(self.path) as connection:
+    with closing(sqlite3.connect(self.path)) as connection, connection:
       self.assertEqual(connection.execute("SELECT version FROM version").fetchone()[0], 8)
 
   def test_future_session_version_rejected_without_changes(self):
     self.database()
-    with sqlite3.connect(self.path) as connection:
+    with closing(sqlite3.connect(self.path)) as connection, connection:
       connection.execute("UPDATE version SET version=9")
     before = self.path.read_bytes()
     with patch.dict(sys.modules, {"telethon": self.fake_telethon()}), self.assertRaises(ValueError):
@@ -112,12 +113,12 @@ class CompatTests(unittest.TestCase):
 
   def test_known_v7_six_columns_reconciles_version(self):
     self.database()
-    with sqlite3.connect(self.path) as connection:
+    with closing(sqlite3.connect(self.path)) as connection, connection:
       connection.execute("ALTER TABLE sessions ADD COLUMN tmp_auth_key blob")
       connection.execute("UPDATE version SET version=7")
     with patch.dict(sys.modules, {"telethon": self.fake_telethon()}):
       c.create_telegram_client(self.path, 123, "fake")
-    with sqlite3.connect(self.path) as connection:
+    with closing(sqlite3.connect(self.path)) as connection, connection:
       self.assertEqual(connection.execute("SELECT version FROM version").fetchone()[0], 8)
 
 
