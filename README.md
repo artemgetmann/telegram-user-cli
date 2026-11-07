@@ -120,6 +120,14 @@ an installed caller. These source changes do not perform a cutover.
 
 ## Connect an agent
 
+For agents that repeatedly use one account, the optional `telegram-user-bound`
+entrypoint reads one operator-controlled, non-secret binding file. It pins the env
+file, session and shared locks, rejects caller selector overrides, and delegates to
+the existing CLI without a shell. `telegram-user-bound --help` needs no configuration;
+`--check-binding` validates configuration without opening any selected target.
+See [agent binding](docs/agent-binding.md). Existing `telegram-user` commands and
+defaults are unchanged. This source addition does not install or activate a binding.
+
 Give your agent the output of `telegram-user skill`, or the bundled
 [SKILL.md](src/telegram_user_cli/SKILL.md). The basic workflow is:
 resolve the intended recipient, read the relevant chat, prepare exact text in a file,

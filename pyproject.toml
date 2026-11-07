@@ -18,6 +18,7 @@ Issues = "https://github.com/artemgetmann/telegram-user-cli/issues"
 
 [project.scripts]
 telegram-user = "telegram_user_cli.cli:main"
+telegram-user-bound = "telegram_user_cli.binding:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
